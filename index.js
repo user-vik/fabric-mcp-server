@@ -270,7 +270,9 @@ function summarizeRun(r) {
 // ─── Write-mode gating ──────────────────────────────────────────────────────
 const WRITE_ENABLED = (process.env.FABRIC_MCP_MODE ?? "read").toLowerCase() === "write";
 if (WRITE_ENABLED) {
-  console.error("[fabric-mcp] write mode enabled — run_pipeline + cancel_pipeline_run exposed");
+  console.error(
+    "[fabric-mcp] write mode enabled — run_pipeline, cancel_pipeline_run, refresh_dataset, update_from_git exposed",
+  );
 }
 
 const server = new McpServer({ name: "fabric-mcp", version: VERSION });
@@ -400,6 +402,89 @@ server.registerTool(
   }),
 );
 
+server.registerTool(
+  "list_items",
+  {
+    description:
+      "List items in a Fabric workspace — notebooks, lakehouses, warehouses, semantic models, reports, data pipelines, etc. Optional type filter. Accepts workspace by display name or GUID.",
+    inputSchema: {
+      workspace: z.string().describe("Workspace display name or GUID"),
+      type: z
+        .string()
+        .optional()
+        .describe(
+          "Optional item type filter, e.g. Notebook, Lakehouse, Warehouse, SemanticModel, Report, DataPipeline",
+        ),
+    },
+  },
+  safeTool(async ({ workspace, type }) => {
+    const ws = await resolveWorkspace(workspace);
+    const path = `/workspaces/${ws.id}/items${type ? `?type=${encodeURIComponent(type)}` : ""}`;
+    const items = await fabricListAll(path);
+    return ok({
+      workspace: { id: ws.id, displayName: ws.displayName },
+      ...(type ? { type } : {}),
+      count: items.length,
+      items: items.map((i) => ({
+        id: i.id,
+        type: i.type,
+        displayName: i.displayName,
+        description: i.description,
+      })),
+    });
+  }),
+);
+
+server.registerTool(
+  "get_refresh_history",
+  {
+    description:
+      "Get recent refresh history for a semantic model (dataset), most-recent first — check whether a scheduled or on-demand refresh succeeded and why it failed. Accepts workspace + dataset by display name or GUID.",
+    inputSchema: {
+      workspace: z.string().describe("Workspace display name or GUID"),
+      dataset: z.string().describe("Semantic model (dataset) display name or GUID"),
+      top: z
+        .number()
+        .int()
+        .positive()
+        .max(100)
+        .optional()
+        .describe("Max refresh entries to return (default 20)"),
+    },
+  },
+  safeTool(async ({ workspace, dataset, top }) => {
+    const ws = await resolveWorkspace(workspace);
+    const ds = await resolveDataset(ws.id, dataset);
+    const data = await powerbi(
+      "GET",
+      `/groups/${ws.id}/datasets/${ds.id}/refreshes`,
+      null,
+      { $top: top ?? 20 },
+    );
+    return ok({
+      workspace: { id: ws.id, displayName: ws.displayName },
+      dataset: { id: ds.id, displayName: ds.displayName ?? dataset },
+      refreshes: data.value ?? [],
+    });
+  }),
+);
+
+server.registerTool(
+  "get_git_status",
+  {
+    description:
+      "Show the Git status of a Fabric workspace: items changed between the workspace and its connected Git branch, plus the remote commit hash and workspace head. Requires the workspace to be connected to Git.",
+    inputSchema: {
+      workspace: z.string().describe("Workspace display name or GUID"),
+    },
+  },
+  safeTool(async ({ workspace }) => {
+    const ws = await resolveWorkspace(workspace);
+    const data = await fabric("GET", `/workspaces/${ws.id}/git/status`);
+    return ok({ workspace: { id: ws.id, displayName: ws.displayName }, ...data });
+  }),
+);
+
 if (WRITE_ENABLED) {
   server.registerTool(
     "run_pipeline",
@@ -454,6 +539,83 @@ if (WRITE_ENABLED) {
         `[fabric-mcp][AUDIT] ${new Date().toISOString()} cancel_pipeline_run ws=${ws.id} item=${pl.id} job=${job_instance_id}`,
       );
       return ok({ cancelRequested: true, operationLocation: data._location ?? null });
+    }),
+  );
+
+  server.registerTool(
+    "refresh_dataset",
+    {
+      description:
+        "Trigger an on-demand refresh of a semantic model (dataset). Returns the accepted request; use get_refresh_history to track completion. Accepts workspace + dataset by display name or GUID. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        dataset: z.string().describe("Semantic model (dataset) display name or GUID"),
+      },
+    },
+    safeTool(async ({ workspace, dataset }) => {
+      const ws = await resolveWorkspace(workspace);
+      const ds = await resolveDataset(ws.id, dataset);
+      const data = await powerbi(
+        "POST",
+        `/groups/${ws.id}/datasets/${ds.id}/refreshes`,
+        { notifyOption: "NoNotification" },
+      );
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} refresh_dataset ws=${ws.id} dataset=${ds.id}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        dataset: { id: ds.id, displayName: ds.displayName ?? dataset },
+        accepted: true,
+        operationLocation: data._location ?? null,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "update_from_git",
+    {
+      description:
+        "Update a Fabric workspace from its connected Git branch (pull repo -> workspace). Reads the current Git status to resolve the target commit, then updates, preferring the remote branch on conflicts. Long-running: poll get_git_status for completion. Requires the workspace to be connected to Git and FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+      },
+    },
+    safeTool(async ({ workspace }) => {
+      const ws = await resolveWorkspace(workspace);
+      const status = await fabric("GET", `/workspaces/${ws.id}/git/status`);
+      const remoteCommitHash = status?.remoteCommitHash;
+      if (!remoteCommitHash) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Workspace "${ws.displayName ?? ws.id}" has no remote commit to update from — is it connected to Git? Status: ${JSON.stringify(status)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      const body = {
+        remoteCommitHash,
+        workspaceHead: status?.workspaceHead,
+        conflictResolution: {
+          conflictResolutionType: "Workspace",
+          conflictResolutionPolicy: "PreferRemote",
+        },
+        options: { allowOverrideItems: true },
+      };
+      const data = await fabric("POST", `/workspaces/${ws.id}/git/updateFromGit`, body);
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} update_from_git ws=${ws.id} remoteCommitHash=${remoteCommitHash}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        requested: true,
+        remoteCommitHash,
+        operationLocation: data._location ?? null,
+        note: "Update accepted (long-running). Poll get_git_status for completion.",
+      });
     }),
   );
 }

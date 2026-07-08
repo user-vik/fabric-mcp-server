@@ -15,12 +15,17 @@ It talks to the public Fabric REST API (`api.fabric.microsoft.com`) and the Powe
 | Tool | Mode | Description |
 |------|------|-------------|
 | `list_workspaces` | read | List all Fabric workspaces the signed-in identity can see. |
+| `list_items` | read | List items in a workspace (notebooks, lakehouses, warehouses, semantic models, reports, pipelines), optional type filter. |
 | `list_pipelines` | read | List the data pipelines in a workspace. |
 | `list_pipeline_runs` | read | Run (job instance) history for a pipeline, most-recent first, optional status filter. |
 | `get_pipeline_run` | read | Full detail for one run by job instance ID, including `failureReason`. |
+| `get_refresh_history` | read | Recent refresh history for a semantic model, most-recent first — did the refresh succeed, and why did it fail. |
+| `get_git_status` | read | Items changed between the workspace and its connected Git branch, plus remote commit hash and workspace head. |
 | `execute_dax` | read | Run a read-only DAX query against a semantic model (Power BI `executeQueries`) and return the result rows. |
 | `run_pipeline` | **write** | Trigger an on-demand pipeline run. |
 | `cancel_pipeline_run` | **write** | Cancel an in-progress run. |
+| `refresh_dataset` | **write** | Trigger an on-demand refresh of a semantic model. |
+| `update_from_git` | **write** | Update a workspace from its connected Git branch (pull repo → workspace), preferring remote on conflicts. |
 
 The write tools are only registered when `FABRIC_MCP_MODE=write`.
 
@@ -96,7 +101,7 @@ Validate a measure against a live model:
 ## Security notes
 
 - No secrets are stored in the repo. Credentials come from environment variables at runtime; `.env` is git-ignored.
-- `run_pipeline` and `cancel_pipeline_run` are only exposed under `FABRIC_MCP_MODE=write`, and each logs an `[AUDIT]` line to stderr.
+- The write tools (`run_pipeline`, `cancel_pipeline_run`, `refresh_dataset`, `update_from_git`) are only exposed under `FABRIC_MCP_MODE=write`, and each logs an `[AUDIT]` line to stderr.
 - `execute_dax` uses the Power BI `executeQueries` API, which only runs read-only DAX (data-modifying queries are rejected by the service).
 
 ## License
