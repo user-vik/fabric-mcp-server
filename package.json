@@ -1,0 +1,32 @@
+{
+  "name": "fabric-mcp-server",
+  "version": "1.1.0",
+  "description": "MCP server for Microsoft Fabric: data-pipeline run history & job control (Fabric REST API) plus read-only DAX queries against semantic models (Power BI executeQueries)",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "fabric-mcp-server": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "license": "MIT",
+  "author": "Victor Perez",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "microsoft-fabric",
+    "fabric",
+    "data-pipeline",
+    "claude",
+    "anthropic"
+  ],
+  "dependencies": {
+    "@azure/identity": "^4.5.0",
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
