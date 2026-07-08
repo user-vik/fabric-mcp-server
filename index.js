@@ -141,8 +141,11 @@ async function apiRequest(base, scope, method, path, body, extraQuery = {}) {
       err.status = res.status;
       throw err;
     }
-    // 202 Accepted (long-running ops) carries useful headers but often no body.
-    const result = text ? JSON.parse(text) : {};
+    // 202 Accepted (long-running ops) carries useful headers but often no body
+    // (or a literal `null`), so coerce non-object payloads to a plain object
+    // before stamping operation metadata onto it.
+    const parsed = text ? JSON.parse(text) : {};
+    const result = parsed && typeof parsed === "object" ? parsed : { value: parsed };
     if (res.status === 202) {
       result._accepted = true;
       result._location = res.headers.get("location") ?? undefined;
@@ -176,7 +179,7 @@ async function pollLro(opUrl, retryAfterSec) {
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     });
     const text = await res.text();
-    const state = text ? JSON.parse(text) : {};
+    const state = (text ? JSON.parse(text) : {}) ?? {};
     const status = (state.status ?? "").toLowerCase();
     if (status === "failed") {
       throw new Error(`Fabric operation failed: ${JSON.stringify(state.error ?? state)}`);
