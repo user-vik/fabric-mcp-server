@@ -1,5 +1,14 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+} from "node:fs";
+import { join, relative, sep } from "node:path";
+import { tmpdir } from "node:os";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -87,6 +96,9 @@ const PBI_BASE = "https://api.powerbi.com/v1.0/myorg";
 const PBI_SCOPE = "https://analysis.windows.net/powerbi/api/.default";
 const MAX_RETRIES = 3;
 const RETRY_MAX_DELAY_MS = 60_000;
+// Fabric getDefinition/updateDefinition are long-running operations; cap how
+// long we poll before giving up.
+const LRO_MAX_WAIT_MS = 300_000;
 
 async function getToken(scope = FABRIC_SCOPE) {
   const t = await credential.getToken(scope);
@@ -149,6 +161,52 @@ async function fabric(method, path, body, extraQuery = {}) {
 // "/groups/{id}/datasets/{id}/executeQueries".
 async function powerbi(method, path, body, extraQuery = {}) {
   return apiRequest(PBI_BASE, PBI_SCOPE, method, path, body, extraQuery);
+}
+
+// Polls a Fabric long-running operation (absolute status URL from a 202
+// Location header) to completion. Returns the operation's result body, or the
+// final status if there is no separate result. Throws on Failed/timeout.
+async function pollLro(opUrl, retryAfterSec) {
+  const started = Date.now();
+  let delay = Math.max((retryAfterSec ?? 1) * 1000, 1000);
+  while (Date.now() - started < LRO_MAX_WAIT_MS) {
+    await sleep(delay);
+    const token = await getToken(FABRIC_SCOPE);
+    const res = await fetch(opUrl, {
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    });
+    const text = await res.text();
+    const state = text ? JSON.parse(text) : {};
+    const status = (state.status ?? "").toLowerCase();
+    if (status === "failed") {
+      throw new Error(`Fabric operation failed: ${JSON.stringify(state.error ?? state)}`);
+    }
+    if (status === "succeeded") {
+      const resultLoc = res.headers.get("location") ?? `${opUrl}/result`;
+      const rr = await fetch(resultLoc, {
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      });
+      if (rr.ok) {
+        const rt = await rr.text();
+        return rt ? JSON.parse(rt) : {};
+      }
+      return state;
+    }
+    const ra = parseInt(res.headers.get("retry-after") ?? "", 10);
+    if (Number.isFinite(ra)) delay = Math.max(ra * 1000, 1000);
+  }
+  throw new Error(`Fabric operation timed out after ${LRO_MAX_WAIT_MS}ms: ${opUrl}`);
+}
+
+// Runs a Fabric call that may complete synchronously (200) or as an LRO (202 +
+// Location). Returns the final result body either way.
+async function fabricLro(method, path, body) {
+  const res = await fabric(method, path, body);
+  if (res && res._accepted && res._location) {
+    const ra = res._retryAfter ? parseInt(res._retryAfter, 10) : undefined;
+    return await pollLro(res._location, ra);
+  }
+  return res;
 }
 
 // Walks Fabric's continuationToken paging for a list endpoint, accumulating
@@ -250,6 +308,84 @@ async function resolveDataset(workspaceId, dataset) {
   return hit;
 }
 
+// Resolve any Fabric item by display name or GUID, optionally narrowed by type.
+// Errors on ambiguous names so a definition write can't hit the wrong item.
+const itemCache = new Map(); // `${wsId}/${type||'*'}/${name}` -> {id, displayName, type}
+
+async function resolveItem(workspaceId, item, type) {
+  if (!item) throw new Error("item is required (display name or GUID)");
+  if (GUID_RE.test(item)) return { id: item, displayName: undefined, type };
+  const key = `${workspaceId}/${(type ?? "*").toLowerCase()}/${item.toLowerCase()}`;
+  if (itemCache.has(key)) return itemCache.get(key);
+  const path = `/workspaces/${workspaceId}/items${type ? `?type=${encodeURIComponent(type)}` : ""}`;
+  const items = await fabricListAll(path);
+  const matches = items.filter((i) => (i.displayName ?? "").toLowerCase() === item.toLowerCase());
+  if (matches.length === 0) {
+    const names = items.map((i) => i.displayName).filter(Boolean);
+    throw new Error(
+      `Item "${item}"${type ? ` of type ${type}` : ""} not found in workspace. Available: ${names.slice(0, 50).join(", ") || "(none)"}`,
+    );
+  }
+  if (matches.length > 1) {
+    const types = [...new Set(matches.map((m) => m.type))];
+    throw new Error(
+      `Item "${item}" is ambiguous (${matches.length} matches, types: ${types.join(", ")}). Pass type to disambiguate or use the GUID.`,
+    );
+  }
+  const hit = { id: matches[0].id, displayName: matches[0].displayName, type: matches[0].type };
+  itemCache.set(key, hit);
+  return hit;
+}
+
+// ─── Item-definition file helpers ───────────────────────────────────────────
+// A Fabric item definition is a set of parts (files). On disk it's the folder
+// Git sync produces: a `.platform` manifest plus a `definition/` subtree.
+function collectFiles(dir, out = []) {
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) collectFiles(full, out);
+    else out.push(full);
+  }
+  return out;
+}
+
+function readDefinitionFromDir(dir) {
+  if (!existsSync(dir)) throw new Error(`definition_path does not exist: ${dir}`);
+  const files = collectFiles(dir);
+  if (!files.some((f) => f.endsWith(".platform"))) {
+    throw new Error(
+      `No .platform file found under ${dir} — this does not look like a Fabric item definition folder. Point definition_path at the item folder (the one containing .platform and definition/).`,
+    );
+  }
+  return {
+    parts: files.map((f) => ({
+      path: relative(dir, f).split(sep).join("/"),
+      payload: readFileSync(f).toString("base64"),
+      payloadType: "InlineBase64",
+    })),
+  };
+}
+
+function snapshotDir() {
+  const d = join(tmpdir(), "fabric-mcp-snapshots");
+  mkdirSync(d, { recursive: true });
+  return d;
+}
+
+function writeSnapshot(itemId, definition) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const file = join(snapshotDir(), `${itemId}-${stamp}.json`);
+  writeFileSync(file, JSON.stringify(definition, null, 2), "utf8");
+  return file;
+}
+
+function readSnapshot(file) {
+  const parsed = JSON.parse(readFileSync(file, "utf8"));
+  if (parsed.parts) return parsed;
+  if (parsed.definition?.parts) return parsed.definition;
+  throw new Error(`Snapshot file ${file} has no parts.`);
+}
+
 function summarizeRun(r) {
   return {
     jobInstanceId: r.id,
@@ -271,7 +407,7 @@ function summarizeRun(r) {
 const WRITE_ENABLED = (process.env.FABRIC_MCP_MODE ?? "read").toLowerCase() === "write";
 if (WRITE_ENABLED) {
   console.error(
-    "[fabric-mcp] write mode enabled — run_pipeline, cancel_pipeline_run, refresh_dataset, update_from_git exposed",
+    "[fabric-mcp] write mode enabled — run_pipeline, cancel_pipeline_run, refresh_dataset, update_from_git, update_item_definition exposed",
   );
 }
 
@@ -485,6 +621,59 @@ server.registerTool(
   }),
 );
 
+server.registerTool(
+  "get_item_definition",
+  {
+    description:
+      "Get the definition (source parts) of a Fabric item — semantic model TMDL, notebook content, report, etc. By default returns a manifest of part paths (no payloads, to stay small); pass 'part' with a path to get that file's decoded contents. Useful for inspecting or backing up a live item before deploying. Accepts workspace + item by display name or GUID.",
+    inputSchema: {
+      workspace: z.string().describe("Workspace display name or GUID"),
+      item: z.string().describe("Item display name or GUID"),
+      type: z
+        .string()
+        .optional()
+        .describe("Item type to disambiguate the name, e.g. SemanticModel, Notebook, Report"),
+      format: z
+        .string()
+        .optional()
+        .describe("Optional definition format, e.g. 'ipynb' for notebooks"),
+      part: z.string().optional().describe("A part path (from the manifest) to return decoded to text"),
+    },
+  },
+  safeTool(async ({ workspace, item, type, format, part }) => {
+    const ws = await resolveWorkspace(workspace);
+    const it = await resolveItem(ws.id, item, type);
+    const q = format ? `?format=${encodeURIComponent(format)}` : "";
+    const data = await fabricLro("POST", `/workspaces/${ws.id}/items/${it.id}/getDefinition${q}`);
+    const parts = data?.definition?.parts ?? [];
+    const itemInfo = { id: it.id, displayName: it.displayName ?? item, type: it.type };
+    if (part) {
+      const p = parts.find((x) => x.path === part);
+      if (!p) throw new Error(`Part "${part}" not found. Parts: ${parts.map((x) => x.path).join(", ")}`);
+      const content =
+        p.payloadType === "InlineBase64"
+          ? Buffer.from(p.payload ?? "", "base64").toString("utf8")
+          : `(non-base64 payloadType: ${p.payloadType})`;
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        item: itemInfo,
+        part: { path: p.path, payloadType: p.payloadType, content },
+      });
+    }
+    return ok({
+      workspace: { id: ws.id, displayName: ws.displayName },
+      item: itemInfo,
+      partCount: parts.length,
+      parts: parts.map((x) => ({
+        path: x.path,
+        payloadType: x.payloadType,
+        base64Length: (x.payload ?? "").length,
+      })),
+      note: "Call again with 'part' set to a path to get that file's decoded contents.",
+    });
+  }),
+);
+
 if (WRITE_ENABLED) {
   server.registerTool(
     "run_pipeline",
@@ -615,6 +804,74 @@ if (WRITE_ENABLED) {
         remoteCommitHash,
         operationLocation: data._location ?? null,
         note: "Update accepted (long-running). Poll get_git_status for completion.",
+      });
+    }),
+  );
+
+  server.registerTool(
+    "update_item_definition",
+    {
+      description:
+        "Deploy an item definition (semantic model, notebook, report, ...) to a live Fabric workspace from a local definition folder, OVERWRITING the item's current definition. Safety: snapshots the current live definition to a local JSON first (returned as snapshotPath) so you can roll back via restore_snapshot. Overwrites wholesale — definition_path must hold the COMPLETE definition (a .platform file is required). Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        item: z.string().describe("Target item display name or GUID"),
+        type: z
+          .string()
+          .optional()
+          .describe("Item type to disambiguate the name, e.g. SemanticModel, Notebook, Report"),
+        definition_path: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute path to the local item definition folder (contains .platform and definition/). Provide this OR restore_snapshot.",
+          ),
+        restore_snapshot: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute path to a snapshot JSON previously written by this tool, to roll back. Provide this OR definition_path.",
+          ),
+        update_metadata: z
+          .boolean()
+          .optional()
+          .describe("Also update display name/description from the .platform file. Default false."),
+      },
+    },
+    safeTool(async ({ workspace, item, type, definition_path, restore_snapshot, update_metadata }) => {
+      if (!definition_path && !restore_snapshot)
+        throw new Error("Provide either definition_path (folder to deploy) or restore_snapshot (JSON to roll back).");
+      if (definition_path && restore_snapshot)
+        throw new Error("Provide only one of definition_path or restore_snapshot.");
+      const ws = await resolveWorkspace(workspace);
+      const it = await resolveItem(ws.id, item, type);
+      const definition = restore_snapshot
+        ? readSnapshot(restore_snapshot)
+        : readDefinitionFromDir(definition_path);
+      if (!definition.parts?.length) throw new Error("No parts to deploy.");
+
+      let snapshotPath = null;
+      try {
+        const current = await fabricLro("POST", `/workspaces/${ws.id}/items/${it.id}/getDefinition`);
+        if (current?.definition?.parts?.length) snapshotPath = writeSnapshot(it.id, current.definition);
+      } catch (e) {
+        console.error(`[fabric-mcp] snapshot skipped for ${it.id}: ${e.message}`);
+      }
+
+      const q = update_metadata ? "?updateMetadata=true" : "";
+      await fabricLro("POST", `/workspaces/${ws.id}/items/${it.id}/updateDefinition${q}`, { definition });
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} update_item_definition ws=${ws.id} item=${it.id} parts=${definition.parts.length} source=${restore_snapshot ? "snapshot" : definition_path} snapshot=${snapshotPath ?? "none"}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
+        updated: true,
+        partsDeployed: definition.parts.length,
+        snapshotPath,
+        rollback: snapshotPath
+          ? `Roll back with update_item_definition restore_snapshot="${snapshotPath}"`
+          : "No prior definition captured (item may have been empty); no automatic rollback available.",
       });
     }),
   );
