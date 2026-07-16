@@ -94,6 +94,11 @@ const FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default";
 // Power BI groupId.
 const PBI_BASE = "https://api.powerbi.com/v1.0/myorg";
 const PBI_SCOPE = "https://analysis.windows.net/powerbi/api/.default";
+// OneLake DFS (onelake.dfs.fabric.microsoft.com) — lag-free file/table listing
+// and small-file reads straight from OneLake. Uses the Azure Storage token
+// audience (not the Fabric API audience) and addresses items by GUID.
+const ONELAKE_BASE = "https://onelake.dfs.fabric.microsoft.com";
+const STORAGE_SCOPE = "https://storage.azure.com/.default";
 const MAX_RETRIES = 3;
 const RETRY_MAX_DELAY_MS = 60_000;
 // Fabric getDefinition/updateDefinition are long-running operations; cap how
@@ -166,6 +171,36 @@ async function powerbi(method, path, body, extraQuery = {}) {
   return apiRequest(PBI_BASE, PBI_SCOPE, method, path, body, extraQuery);
 }
 
+// OneLake DFS call. Returns parsed JSON by default, or the raw response text
+// when `raw` is set (file reads). Uses the Storage audience token and retries
+// 429 honoring Retry-After, like apiRequest.
+async function onelake(method, path, { query = {}, raw = false } = {}) {
+  const token = await getToken(STORAGE_SCOPE);
+  const url = new URL(`${ONELAKE_BASE}${path}`);
+  for (const [k, v] of Object.entries(query)) {
+    if (v != null) url.searchParams.set(k, String(v));
+  }
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(url, { method, headers: { Authorization: `Bearer ${token}` } });
+    if (res.status === 429 && attempt < MAX_RETRIES) {
+      const retryAfter = parseInt(res.headers.get("retry-after") ?? "", 10);
+      const backoffMs = Number.isFinite(retryAfter)
+        ? Math.min(retryAfter * 1000, RETRY_MAX_DELAY_MS)
+        : Math.min(2 ** attempt * 500, RETRY_MAX_DELAY_MS);
+      await sleep(backoffMs);
+      continue;
+    }
+    const text = await res.text();
+    if (!res.ok) {
+      const err = new Error(`${method} ${path} -> ${res.status}: ${text}`);
+      err.status = res.status;
+      throw err;
+    }
+    if (raw) return text;
+    return text ? JSON.parse(text) : {};
+  }
+}
+
 // Polls a Fabric long-running operation (absolute status URL from a 202
 // Location header) to completion. Returns the operation's result body, or the
 // final status if there is no separate result. Throws on Failed/timeout.
@@ -210,6 +245,29 @@ async function fabricLro(method, path, body) {
     return await pollLro(res._location, ra);
   }
   return res;
+}
+
+// Polls a Fabric job instance (absolute URL from a jobs/instances 202 Location)
+// until it reaches a terminal status, then returns the final job-instance body.
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled", "deduped"]);
+async function pollJobInstance(instanceUrl, retryAfterSec) {
+  const started = Date.now();
+  let delay = Math.max((retryAfterSec ?? 2) * 1000, 2000);
+  while (Date.now() - started < LRO_MAX_WAIT_MS) {
+    await sleep(delay);
+    const token = await getToken(FABRIC_SCOPE);
+    const res = await fetch(instanceUrl, {
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    });
+    const text = await res.text();
+    const state = (text ? JSON.parse(text) : {}) ?? {};
+    if (TERMINAL_JOB_STATUSES.has((state.status ?? "").toLowerCase())) return state;
+    const ra = parseInt(res.headers.get("retry-after") ?? "", 10);
+    if (Number.isFinite(ra)) delay = Math.max(ra * 1000, 2000);
+  }
+  throw new Error(
+    `Job instance did not reach a terminal status within ${LRO_MAX_WAIT_MS}ms: ${instanceUrl}`,
+  );
 }
 
 // Walks Fabric's continuationToken paging for a list endpoint, accumulating
@@ -340,6 +398,28 @@ async function resolveItem(workspaceId, item, type) {
   return hit;
 }
 
+// deployment-pipeline cache: name(lower) -> {id, displayName}. Deployment
+// pipelines are tenant-level (under /deploymentPipelines, not a workspace).
+const deployPipeCache = new Map();
+
+async function resolveDeploymentPipeline(pipeline) {
+  if (!pipeline) throw new Error("deployment_pipeline is required (display name or GUID)");
+  if (GUID_RE.test(pipeline)) return { id: pipeline, displayName: undefined };
+  const key = pipeline.toLowerCase();
+  if (deployPipeCache.has(key)) return deployPipeCache.get(key);
+  const all = await fabricListAll("/deploymentPipelines");
+  for (const p of all)
+    deployPipeCache.set((p.displayName ?? "").toLowerCase(), { id: p.id, displayName: p.displayName });
+  const hit = deployPipeCache.get(key);
+  if (!hit) {
+    const names = all.map((p) => p.displayName).filter(Boolean);
+    throw new Error(
+      `Deployment pipeline "${pipeline}" not found. Available: ${names.join(", ") || "(none)"}`,
+    );
+  }
+  return hit;
+}
+
 // ─── Item-definition file helpers ───────────────────────────────────────────
 // A Fabric item definition is a set of parts (files). On disk it's the folder
 // Git sync produces: a `.platform` manifest plus a `definition/` subtree.
@@ -410,7 +490,7 @@ function summarizeRun(r) {
 const WRITE_ENABLED = (process.env.FABRIC_MCP_MODE ?? "read").toLowerCase() === "write";
 if (WRITE_ENABLED) {
   console.error(
-    "[fabric-mcp] write mode enabled — run_pipeline, cancel_pipeline_run, refresh_dataset, update_from_git, update_item_definition exposed",
+    "[fabric-mcp] write mode enabled — run_pipeline, cancel_pipeline_run, refresh_dataset, update_from_git, update_item_definition, create_schedule, update_schedule, delete_schedule, deploy_stage, run_notebook, create_item, delete_item, add_workspace_role exposed",
   );
 }
 
@@ -677,6 +757,243 @@ server.registerTool(
   }),
 );
 
+server.registerTool(
+  "list_schedules",
+  {
+    description:
+      "List the job schedules on a Fabric item (data pipeline, notebook, ...), including each schedule's owner (id + type). Use the owner to detect ownership drift: deploying an item, or calling update_item_definition, recreates its schedules under the CALLER's identity — so a schedule you expect to be service-principal-owned can silently flip to a user. Accepts workspace + item by display name or GUID.",
+    inputSchema: {
+      workspace: z.string().describe("Workspace display name or GUID"),
+      item: z.string().describe("Item display name or GUID (the pipeline/notebook the schedule runs)"),
+      type: z
+        .string()
+        .optional()
+        .describe("Item type to disambiguate the name, e.g. DataPipeline, Notebook"),
+      job_type: z
+        .string()
+        .optional()
+        .describe("Schedule job type (default 'Pipeline'; use 'RunNotebook' for notebooks)"),
+    },
+  },
+  safeTool(async ({ workspace, item, type, job_type }) => {
+    const ws = await resolveWorkspace(workspace);
+    const it = await resolveItem(ws.id, item, type);
+    const jt = job_type ?? "Pipeline";
+    const schedules = await fabricListAll(
+      `/workspaces/${ws.id}/items/${it.id}/jobs/${encodeURIComponent(jt)}/schedules`,
+    );
+    return ok({
+      workspace: { id: ws.id, displayName: ws.displayName },
+      item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
+      jobType: jt,
+      schedules: schedules.map((s) => ({
+        id: s.id,
+        enabled: s.enabled,
+        owner: s.owner ? { id: s.owner.id, type: s.owner.type } : null,
+        createdDateTime: s.createdDateTime,
+        configuration: s.configuration,
+      })),
+    });
+  }),
+);
+
+server.registerTool(
+  "list_deployment_pipelines",
+  {
+    description:
+      "List the Fabric deployment pipelines the signed-in identity can see — used to promote item definitions across stages (e.g. Dev -> Test -> Prod).",
+    inputSchema: {},
+  },
+  safeTool(async () => {
+    const all = await fabricListAll("/deploymentPipelines");
+    return ok(all.map((p) => ({ id: p.id, displayName: p.displayName, description: p.description })));
+  }),
+);
+
+server.registerTool(
+  "list_deployment_stages",
+  {
+    description:
+      "List the stages of a Fabric deployment pipeline (order, display name, assigned workspace). Pass 'stage' to also return that stage's items — the source item IDs + types you feed to deploy_stage. Accepts the deployment pipeline (and optional stage) by display name or GUID.",
+    inputSchema: {
+      deployment_pipeline: z.string().describe("Deployment pipeline display name or GUID"),
+      stage: z
+        .string()
+        .optional()
+        .describe("Optional stage display name or GUID to also list that stage's items"),
+    },
+  },
+  safeTool(async ({ deployment_pipeline, stage }) => {
+    const dp = await resolveDeploymentPipeline(deployment_pipeline);
+    const stages = await fabricListAll(`/deploymentPipelines/${dp.id}/stages`);
+    const result = {
+      deploymentPipeline: { id: dp.id, displayName: dp.displayName ?? deployment_pipeline },
+      stages: stages.map((s) => ({
+        id: s.id,
+        order: s.order,
+        displayName: s.displayName,
+        workspaceId: s.workspaceId,
+        workspaceName: s.workspaceName,
+        isPublic: s.isPublic,
+      })),
+    };
+    if (stage) {
+      const match = stages.find((s) =>
+        GUID_RE.test(stage)
+          ? s.id === stage
+          : (s.displayName ?? "").toLowerCase() === stage.toLowerCase(),
+      );
+      if (!match)
+        throw new Error(
+          `Stage "${stage}" not found. Stages: ${stages.map((s) => s.displayName).join(", ")}`,
+        );
+      const items = await fabricListAll(`/deploymentPipelines/${dp.id}/stages/${match.id}/items`);
+      result.stageItems = {
+        stage: { id: match.id, displayName: match.displayName },
+        items: items.map((i) => ({
+          sourceItemId: i.itemId,
+          itemDisplayName: i.itemDisplayName,
+          itemType: i.itemType,
+        })),
+      };
+    }
+    return ok(result);
+  }),
+);
+
+server.registerTool(
+  "list_onelake",
+  {
+    description:
+      "List files/folders under a Fabric item in OneLake via the DFS API — lag-free ground truth for 'did this table/file land yet?' (the SQL analytics endpoint's metadata can lag minutes behind actual writes). Defaults to the item's Delta tables under the default schema. Accepts workspace + item by display name or GUID.",
+    inputSchema: {
+      workspace: z.string().describe("Workspace display name or GUID"),
+      item: z.string().describe("Lakehouse/warehouse/item display name or GUID"),
+      type: z.string().optional().describe("Item type to disambiguate the name, e.g. Lakehouse, Warehouse"),
+      directory: z
+        .string()
+        .optional()
+        .describe("Directory under the item to list, e.g. 'Tables/dbo' (default), 'Tables/<schema>', 'Files'"),
+      recursive: z.boolean().optional().describe("Recurse into subdirectories (default false)"),
+    },
+  },
+  safeTool(async ({ workspace, item, type, directory, recursive }) => {
+    const ws = await resolveWorkspace(workspace);
+    const it = await resolveItem(ws.id, item, type);
+    const dir = directory ?? "Tables/dbo";
+    const data = await onelake("GET", `/${ws.id}`, {
+      query: {
+        resource: "filesystem",
+        recursive: recursive ? "true" : "false",
+        directory: `${it.id}/${dir}`,
+      },
+    });
+    const paths = (data.paths ?? []).map((p) => ({
+      name: p.name,
+      isDirectory: p.isDirectory === "true" || p.isDirectory === true,
+      contentLength: p.contentLength != null ? Number(p.contentLength) : undefined,
+      lastModified: p.lastModified,
+    }));
+    return ok({
+      workspace: { id: ws.id, displayName: ws.displayName },
+      item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
+      directory: dir,
+      count: paths.length,
+      paths,
+    });
+  }),
+);
+
+server.registerTool(
+  "read_onelake_file",
+  {
+    description:
+      "Read a small file from a Fabric item's OneLake storage (e.g. a notebook output, log, or JSON result under Files/). Returns decoded text, capped in size. Accepts workspace + item by display name or GUID.",
+    inputSchema: {
+      workspace: z.string().describe("Workspace display name or GUID"),
+      item: z.string().describe("Item display name or GUID"),
+      type: z.string().optional().describe("Item type to disambiguate the name"),
+      path: z.string().describe("File path under the item, e.g. 'Files/output/summary.json'"),
+      max_bytes: z
+        .number()
+        .int()
+        .positive()
+        .max(1_000_000)
+        .optional()
+        .describe("Max characters to return (default 100000)"),
+    },
+  },
+  safeTool(async ({ workspace, item, type, path, max_bytes }) => {
+    const ws = await resolveWorkspace(workspace);
+    const it = await resolveItem(ws.id, item, type);
+    const cap = max_bytes ?? 100_000;
+    const text = await onelake("GET", `/${ws.id}/${it.id}/${path.replace(/^\/+/, "")}`, { raw: true });
+    const truncated = text.length > cap;
+    return ok({
+      workspace: { id: ws.id, displayName: ws.displayName },
+      item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
+      path,
+      length: text.length,
+      truncated,
+      content: truncated ? text.slice(0, cap) : text,
+    });
+  }),
+);
+
+server.registerTool(
+  "list_workspace_roles",
+  {
+    description:
+      "List the role assignments on a Fabric workspace — which principals (users, groups, service principals) hold Admin/Member/Contributor/Viewer. Accepts workspace by display name or GUID.",
+    inputSchema: {
+      workspace: z.string().describe("Workspace display name or GUID"),
+    },
+  },
+  safeTool(async ({ workspace }) => {
+    const ws = await resolveWorkspace(workspace);
+    const roles = await fabricListAll(`/workspaces/${ws.id}/roleAssignments`);
+    return ok({
+      workspace: { id: ws.id, displayName: ws.displayName },
+      roleAssignments: roles.map((r) => ({
+        id: r.id,
+        role: r.role,
+        principal: r.principal
+          ? { id: r.principal.id, displayName: r.principal.displayName, type: r.principal.type }
+          : null,
+      })),
+    });
+  }),
+);
+
+server.registerTool(
+  "list_sql_databases",
+  {
+    description:
+      "List the SQL databases in a Fabric workspace and their connection properties (server FQDN, database name, connection string) — resolve a database's endpoint without hunting through the portal. Accepts workspace by display name or GUID; optional name filter.",
+    inputSchema: {
+      workspace: z.string().describe("Workspace display name or GUID"),
+      name: z.string().optional().describe("Optional case-insensitive display-name filter"),
+    },
+  },
+  safeTool(async ({ workspace, name }) => {
+    const ws = await resolveWorkspace(workspace);
+    let dbs = await fabricListAll(`/workspaces/${ws.id}/sqlDatabases`);
+    if (name) dbs = dbs.filter((d) => (d.displayName ?? "").toLowerCase().includes(name.toLowerCase()));
+    return ok({
+      workspace: { id: ws.id, displayName: ws.displayName },
+      count: dbs.length,
+      databases: dbs.map((d) => ({
+        id: d.id,
+        displayName: d.displayName,
+        description: d.description,
+        serverFqdn: d.properties?.serverFqdn,
+        databaseName: d.properties?.databaseName,
+        connectionString: d.properties?.connectionString,
+      })),
+    });
+  }),
+);
+
 if (WRITE_ENABLED) {
   server.registerTool(
     "run_pipeline",
@@ -875,6 +1192,347 @@ if (WRITE_ENABLED) {
         rollback: snapshotPath
           ? `Roll back with update_item_definition restore_snapshot="${snapshotPath}"`
           : "No prior definition captured (item may have been empty); no automatic rollback available.",
+      });
+    }),
+  );
+
+  server.registerTool(
+    "create_schedule",
+    {
+      description:
+        "Create a job schedule on a Fabric item (data pipeline, notebook, ...). The schedule is owned by the identity that creates it. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        item: z.string().describe("Item display name or GUID"),
+        type: z.string().optional().describe("Item type to disambiguate the name, e.g. DataPipeline, Notebook"),
+        job_type: z.string().optional().describe("Schedule job type (default 'Pipeline'; 'RunNotebook' for notebooks)"),
+        enabled: z.boolean().optional().describe("Whether the schedule is enabled (default true)"),
+        configuration: z
+          .record(z.any())
+          .describe(
+            "Schedule configuration, e.g. { type: 'Daily', times: ['08:00','10:00'], localTimeZoneId: 'Eastern Standard Time', startDateTime: '2024-01-01T00:00:00' }. type is Cron | Daily | Weekly.",
+          ),
+      },
+    },
+    safeTool(async ({ workspace, item, type, job_type, enabled, configuration }) => {
+      const ws = await resolveWorkspace(workspace);
+      const it = await resolveItem(ws.id, item, type);
+      const jt = job_type ?? "Pipeline";
+      const body = { enabled: enabled ?? true, configuration };
+      const data = await fabric(
+        "POST",
+        `/workspaces/${ws.id}/items/${it.id}/jobs/${encodeURIComponent(jt)}/schedules`,
+        body,
+      );
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} create_schedule ws=${ws.id} item=${it.id} jobType=${jt}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
+        jobType: jt,
+        created: true,
+        schedule: data,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "update_schedule",
+    {
+      description:
+        "Update a job schedule on a Fabric item — enable/disable (pause/resume) or change its configuration. NOTE: a PATCH re-stamps the schedule's owner to the calling identity, so pausing/resuming a service-principal-owned schedule as a user flips its owner; recreate as the SPN afterward if ownership matters (see list_schedules). If you pass only 'enabled' or only 'configuration', the other is carried over from the current schedule. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        item: z.string().describe("Item display name or GUID"),
+        type: z.string().optional().describe("Item type to disambiguate the name"),
+        job_type: z.string().optional().describe("Schedule job type (default 'Pipeline'; 'RunNotebook' for notebooks)"),
+        schedule_id: z.string().describe("The schedule ID from list_schedules"),
+        enabled: z.boolean().optional().describe("Enable/disable the schedule"),
+        configuration: z.record(z.any()).optional().describe("Replacement schedule configuration object"),
+      },
+    },
+    safeTool(async ({ workspace, item, type, job_type, schedule_id, enabled, configuration }) => {
+      const ws = await resolveWorkspace(workspace);
+      const it = await resolveItem(ws.id, item, type);
+      const jt = job_type ?? "Pipeline";
+      const base = `/workspaces/${ws.id}/items/${it.id}/jobs/${encodeURIComponent(jt)}/schedules/${encodeURIComponent(schedule_id)}`;
+      const current = await fabric("GET", base);
+      const body = {
+        enabled: enabled ?? current.enabled,
+        configuration: configuration ?? current.configuration,
+      };
+      const data = await fabric("PATCH", base, body);
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} update_schedule ws=${ws.id} item=${it.id} schedule=${schedule_id} enabled=${body.enabled}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
+        jobType: jt,
+        updated: true,
+        schedule: data,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "delete_schedule",
+    {
+      description:
+        "Delete a job schedule from a Fabric item. Snapshots the schedule object to a local JSON first (returned as snapshotPath) for reference. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        item: z.string().describe("Item display name or GUID"),
+        type: z.string().optional().describe("Item type to disambiguate the name"),
+        job_type: z.string().optional().describe("Schedule job type (default 'Pipeline'; 'RunNotebook' for notebooks)"),
+        schedule_id: z.string().describe("The schedule ID from list_schedules"),
+      },
+    },
+    safeTool(async ({ workspace, item, type, job_type, schedule_id }) => {
+      const ws = await resolveWorkspace(workspace);
+      const it = await resolveItem(ws.id, item, type);
+      const jt = job_type ?? "Pipeline";
+      const base = `/workspaces/${ws.id}/items/${it.id}/jobs/${encodeURIComponent(jt)}/schedules/${encodeURIComponent(schedule_id)}`;
+      let snapshotPath = null;
+      try {
+        const current = await fabric("GET", base);
+        snapshotPath = writeSnapshot(`schedule-${schedule_id}`, current);
+      } catch (e) {
+        console.error(`[fabric-mcp] schedule snapshot skipped for ${schedule_id}: ${e.message}`);
+      }
+      await fabric("DELETE", base);
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} delete_schedule ws=${ws.id} item=${it.id} schedule=${schedule_id} snapshot=${snapshotPath ?? "none"}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
+        jobType: jt,
+        deleted: true,
+        snapshotPath,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "deploy_stage",
+    {
+      description:
+        "Selectively deploy items from one deployment-pipeline stage to the next (e.g. Dev -> Test). You MUST pass an explicit item list — this tool refuses an empty list so a blanket 'deploy everything' can't happen by accident. Long-running: polls to completion. NOTE: a deploy carries each item's schedule definition and recreates schedules under the CALLER's identity, and it repoints item references to the target stage but does NOT rebind data-source/gateway connections — re-check both after deploying (see list_schedules). Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        deployment_pipeline: z.string().describe("Deployment pipeline display name or GUID"),
+        source_stage: z.string().describe("Source stage display name or GUID"),
+        target_stage: z.string().describe("Target stage display name or GUID"),
+        items: z
+          .array(z.object({ sourceItemId: z.string(), itemType: z.string() }))
+          .min(1)
+          .describe("Items to deploy: [{ sourceItemId, itemType }], from list_deployment_stages stage items"),
+        note: z.string().optional().describe("Optional deployment note"),
+      },
+    },
+    safeTool(async ({ deployment_pipeline, source_stage, target_stage, items, note }) => {
+      const dp = await resolveDeploymentPipeline(deployment_pipeline);
+      const stages = await fabricListAll(`/deploymentPipelines/${dp.id}/stages`);
+      const findStage = (s) =>
+        stages.find((x) =>
+          GUID_RE.test(s) ? x.id === s : (x.displayName ?? "").toLowerCase() === s.toLowerCase(),
+        );
+      const src = findStage(source_stage);
+      const tgt = findStage(target_stage);
+      if (!src)
+        throw new Error(
+          `Source stage "${source_stage}" not found. Stages: ${stages.map((s) => s.displayName).join(", ")}`,
+        );
+      if (!tgt)
+        throw new Error(
+          `Target stage "${target_stage}" not found. Stages: ${stages.map((s) => s.displayName).join(", ")}`,
+        );
+      const body = { sourceStageId: src.id, targetStageId: tgt.id, items, ...(note ? { note } : {}) };
+      const data = await fabricLro("POST", `/deploymentPipelines/${dp.id}/deploy`, body);
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} deploy_stage dp=${dp.id} src=${src.id} tgt=${tgt.id} items=${items.length}`,
+      );
+      return ok({
+        deploymentPipeline: { id: dp.id, displayName: dp.displayName ?? deployment_pipeline },
+        source: { id: src.id, displayName: src.displayName },
+        target: { id: tgt.id, displayName: tgt.displayName },
+        itemsDeployed: items.length,
+        result: data,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "run_notebook",
+    {
+      description:
+        "Run a Fabric notebook on demand as a job. By default waits for a terminal status and returns a run summary; set wait=false to return immediately with the operation location. NOTE: executionData.parameters only inject when the notebook exposes a properly TAGGED parameters cell (ipynb format). A notebook that marks its parameters cell with a '# PARAMETERS_CELL' comment silently ignores injected values and runs with its in-source defaults while still reporting success. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        notebook: z.string().describe("Notebook display name or GUID"),
+        parameters: z
+          .record(z.any())
+          .optional()
+          .describe("Typed parameters, e.g. { myParam: { value: '5', type: 'int' } }"),
+        configuration: z
+          .record(z.any())
+          .optional()
+          .describe("Optional executionData.configuration (Spark conf, environment, defaultLakehouse, ...)"),
+        wait: z.boolean().optional().describe("Wait for terminal status (default true)"),
+      },
+    },
+    safeTool(async ({ workspace, notebook, parameters, configuration, wait }) => {
+      const ws = await resolveWorkspace(workspace);
+      const nb = await resolveItem(ws.id, notebook, "Notebook");
+      const executionData = {};
+      if (parameters) executionData.parameters = parameters;
+      if (configuration) executionData.configuration = configuration;
+      const body = Object.keys(executionData).length ? { executionData } : undefined;
+      const data = await fabric(
+        "POST",
+        `/workspaces/${ws.id}/items/${nb.id}/jobs/instances`,
+        body,
+        { jobType: "RunNotebook" },
+      );
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} run_notebook ws=${ws.id} item=${nb.id}`,
+      );
+      const opLocation = data._location ?? null;
+      if ((wait ?? true) && opLocation) {
+        const ra = data._retryAfter ? parseInt(data._retryAfter, 10) : undefined;
+        const finalState = await pollJobInstance(opLocation, ra);
+        return ok({
+          workspace: { id: ws.id, displayName: ws.displayName },
+          notebook: { id: nb.id, displayName: nb.displayName ?? notebook },
+          run: summarizeRun(finalState),
+        });
+      }
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        notebook: { id: nb.id, displayName: nb.displayName ?? notebook },
+        accepted: true,
+        operationLocation: opLocation,
+        note: "Run accepted. Call again with wait=true to poll to completion.",
+      });
+    }),
+  );
+
+  server.registerTool(
+    "create_item",
+    {
+      description:
+        "Create a new item in a Fabric workspace, optionally from a local definition folder (.platform + definition/). Useful for scaffolding or temporary items (e.g. a notebook). Long-running when a definition is supplied. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        display_name: z.string().describe("Display name for the new item"),
+        type: z.string().describe("Item type, e.g. Notebook, DataPipeline, SemanticModel, Lakehouse"),
+        description: z.string().optional().describe("Optional description"),
+        definition_path: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute path to a local item definition folder (contains .platform and definition/). Omit to create an empty item.",
+          ),
+      },
+    },
+    safeTool(async ({ workspace, display_name, type, description, definition_path }) => {
+      const ws = await resolveWorkspace(workspace);
+      const body = { displayName: display_name, type };
+      if (description) body.description = description;
+      if (definition_path) body.definition = readDefinitionFromDir(definition_path);
+      const data = await fabricLro("POST", `/workspaces/${ws.id}/items`, body);
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} create_item ws=${ws.id} type=${type} name=${display_name}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        created: true,
+        item: { id: data.id, displayName: data.displayName ?? display_name, type: data.type ?? type },
+      });
+    }),
+  );
+
+  server.registerTool(
+    "delete_item",
+    {
+      description:
+        "Delete an item from a Fabric workspace. Best-effort snapshots the item's definition first (returned as snapshotPath) for item types that support getDefinition. NOTE: Gen2 dataflows must be deleted via the dataflows endpoint — the generic items delete returns UnknownError for them; this tool switches automatically when the resolved type is Dataflow. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        item: z.string().describe("Item display name or GUID"),
+        type: z.string().optional().describe("Item type to disambiguate the name, e.g. Notebook, Dataflow, DataPipeline"),
+      },
+    },
+    safeTool(async ({ workspace, item, type }) => {
+      const ws = await resolveWorkspace(workspace);
+      const it = await resolveItem(ws.id, item, type);
+      // resolveItem short-circuits on a GUID and returns no type; fetch it so the
+      // Gen2-dataflow delete quirk still triggers when the caller passed a GUID.
+      let itType = it.type;
+      if (!itType) {
+        try {
+          const meta = await fabric("GET", `/workspaces/${ws.id}/items/${it.id}`);
+          itType = meta.type;
+        } catch (e) {
+          console.error(`[fabric-mcp] type lookup skipped for ${it.id}: ${e.message}`);
+        }
+      }
+      let snapshotPath = null;
+      try {
+        const current = await fabricLro("POST", `/workspaces/${ws.id}/items/${it.id}/getDefinition`);
+        if (current?.definition?.parts?.length) snapshotPath = writeSnapshot(it.id, current.definition);
+      } catch (e) {
+        console.error(`[fabric-mcp] snapshot skipped for ${it.id}: ${e.message}`);
+      }
+      const isDataflow = (itType ?? "").toLowerCase() === "dataflow";
+      const path = isDataflow
+        ? `/workspaces/${ws.id}/dataflows/${it.id}`
+        : `/workspaces/${ws.id}/items/${it.id}`;
+      await fabric("DELETE", path);
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} delete_item ws=${ws.id} item=${it.id} type=${itType ?? "?"} snapshot=${snapshotPath ?? "none"}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        item: { id: it.id, displayName: it.displayName ?? item, type: itType },
+        deleted: true,
+        snapshotPath,
+        rollback: snapshotPath
+          ? `Recreate with create_item from the snapshot's parts (${snapshotPath})`
+          : "No definition captured; no automatic restore available.",
+      });
+    }),
+  );
+
+  server.registerTool(
+    "add_workspace_role",
+    {
+      description:
+        "Grant a principal (user, group, or service principal) a role on a Fabric workspace. Roles: Admin, Member, Contributor, Viewer. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        principal_id: z.string().describe("Object ID of the principal to grant access to"),
+        principal_type: z
+          .string()
+          .optional()
+          .describe("Principal type: User, Group, ServicePrincipal, or ServicePrincipalProfile (default ServicePrincipal)"),
+        role: z.string().describe("Role to grant: Admin, Member, Contributor, or Viewer"),
+      },
+    },
+    safeTool(async ({ workspace, principal_id, principal_type, role }) => {
+      const ws = await resolveWorkspace(workspace);
+      const principal = { id: principal_id, type: principal_type ?? "ServicePrincipal" };
+      const data = await fabric("POST", `/workspaces/${ws.id}/roleAssignments`, { principal, role });
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} add_workspace_role ws=${ws.id} principal=${principal_id} type=${principal.type} role=${role}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        granted: true,
+        principal,
+        role,
+        result: data,
       });
     }),
   );

@@ -1,6 +1,6 @@
 {
   "name": "fabric-mcp-server",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "description": "MCP server for Microsoft Fabric: data-pipeline run history & job control (Fabric REST API) plus read-only DAX queries against semantic models (Power BI executeQueries)",
   "type": "module",
   "main": "index.js",
