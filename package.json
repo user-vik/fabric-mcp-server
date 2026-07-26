@@ -8,7 +8,8 @@
     "fabric-mcp-server": "index.js"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
   },
   "license": "MIT",
   "author": "Victor Perez",
