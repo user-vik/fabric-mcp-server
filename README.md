@@ -60,6 +60,14 @@ cd fabric-mcp-server
 npm install
 ```
 
+## Development
+
+Run the automated regression tests:
+
+```bash
+npm test
+```
+
 ## Configuration
 
 All configuration is via environment variables (see [`.env.example`](.env.example)). Set them in your MCP client's `env` block, or copy `.env.example` to `.env` for local debugging.

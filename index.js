@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -86,7 +87,7 @@ function buildCredential() {
   }
 }
 
-const credential = buildCredential();
+let credential;
 const FABRIC_BASE = "https://api.fabric.microsoft.com/v1";
 const FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default";
 // Power BI REST — used for semantic-model DAX (executeQueries). Different host
@@ -101,16 +102,24 @@ const ONELAKE_BASE = "https://onelake.dfs.fabric.microsoft.com";
 const STORAGE_SCOPE = "https://storage.azure.com/.default";
 const MAX_RETRIES = 3;
 const RETRY_MAX_DELAY_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 // Fabric getDefinition/updateDefinition are long-running operations; cap how
 // long we poll before giving up.
 const LRO_MAX_WAIT_MS = 300_000;
 
 async function getToken(scope = FABRIC_SCOPE) {
-  const t = await credential.getToken(scope);
+  const t = await (credential ??= buildCredential()).getToken(scope);
   return t.token;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function httpError(res, method, target) {
+  const text = await res.text();
+  const err = new Error(`${method} ${target} -> ${res.status}: ${text}`);
+  err.status = res.status;
+  return err;
+}
 
 // Core REST call against a Microsoft API (Fabric or Power BI). Retries on HTTP
 // 429 honoring Retry-After. Returns parsed JSON (or {} for empty body).
@@ -128,6 +137,7 @@ async function apiRequest(base, scope, method, path, body, extraQuery = {}) {
         "Content-Type": "application/json",
       },
       body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (res.status === 429 && attempt < MAX_RETRIES) {
       const retryAfter = parseInt(res.headers.get("retry-after") ?? "", 10);
@@ -171,17 +181,49 @@ async function powerbi(method, path, body, extraQuery = {}) {
   return apiRequest(PBI_BASE, PBI_SCOPE, method, path, body, extraQuery);
 }
 
-// OneLake DFS call. Returns parsed JSON by default, or the raw response text
-// when `raw` is set (file reads). Uses the Storage audience token and retries
-// 429 honoring Retry-After, like apiRequest.
-async function onelake(method, path, { query = {}, raw = false } = {}) {
+async function readResponseBytes(res, maxBytes) {
+  if (!res.body) return { buffer: Buffer.alloc(0), truncated: false };
+  const reader = res.body.getReader();
+  const chunks = [];
+  let bytesRead = 0;
+  let truncated = false;
+  try {
+    while (bytesRead <= maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = maxBytes + 1 - bytesRead;
+      if (value.byteLength > remaining) {
+        chunks.push(Buffer.from(value.subarray(0, remaining)));
+        bytesRead += remaining;
+        truncated = true;
+        break;
+      }
+      chunks.push(Buffer.from(value));
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) {
+        truncated = true;
+        break;
+      }
+    }
+  } finally {
+    if (truncated) await reader.cancel();
+  }
+  return { buffer: Buffer.concat(chunks, bytesRead), truncated };
+}
+
+// OneLake DFS call. Returns parsed JSON by default, or a byte-capped raw
+// response for file reads. Uses the Storage audience token and retries 429
+// honoring Retry-After, like apiRequest.
+async function onelake(method, path, { query = {}, raw = false, maxBytes } = {}) {
   const token = await getToken(STORAGE_SCOPE);
   const url = new URL(`${ONELAKE_BASE}${path}`);
   for (const [k, v] of Object.entries(query)) {
     if (v != null) url.searchParams.set(k, String(v));
   }
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const res = await fetch(url, { method, headers: { Authorization: `Bearer ${token}` } });
+    const headers = { Authorization: `Bearer ${token}` };
+    if (raw && maxBytes != null) headers.Range = `bytes=0-${maxBytes}`;
+    const res = await fetch(url, { method, headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     if (res.status === 429 && attempt < MAX_RETRIES) {
       const retryAfter = parseInt(res.headers.get("retry-after") ?? "", 10);
       const backoffMs = Number.isFinite(retryAfter)
@@ -190,13 +232,25 @@ async function onelake(method, path, { query = {}, raw = false } = {}) {
       await sleep(backoffMs);
       continue;
     }
-    const text = await res.text();
     if (!res.ok) {
-      const err = new Error(`${method} ${path} -> ${res.status}: ${text}`);
-      err.status = res.status;
-      throw err;
+      throw await httpError(res, method, path);
     }
-    if (raw) return text;
+    if (raw) {
+      if (maxBytes != null) {
+        const { buffer, truncated } = await readResponseBytes(res, maxBytes);
+        const contentRange = res.headers.get("content-range");
+        const totalMatch = contentRange?.match(/\/(\d+)$/);
+        const totalBytes = totalMatch ? Number(totalMatch[1]) : undefined;
+        return {
+          text: buffer.subarray(0, maxBytes).toString("utf8"),
+          bytesRead: Math.min(buffer.length, maxBytes),
+          totalBytes,
+          truncated: truncated || (totalBytes != null && totalBytes > maxBytes),
+        };
+      }
+      return res.text();
+    }
+    const text = await res.text();
     return text ? JSON.parse(text) : {};
   }
 }
@@ -204,15 +258,26 @@ async function onelake(method, path, { query = {}, raw = false } = {}) {
 // Polls a Fabric long-running operation (absolute status URL from a 202
 // Location header) to completion. Returns the operation's result body, or the
 // final status if there is no separate result. Throws on Failed/timeout.
-async function pollLro(opUrl, retryAfterSec) {
+async function pollLro(
+  opUrl,
+  retryAfterSec,
+  { fetchFn = fetch, getTokenFn = getToken, sleepFn = sleep } = {},
+) {
   const started = Date.now();
   let delay = Math.max((retryAfterSec ?? 1) * 1000, 1000);
   while (Date.now() - started < LRO_MAX_WAIT_MS) {
-    await sleep(delay);
-    const token = await getToken(FABRIC_SCOPE);
-    const res = await fetch(opUrl, {
+    await sleepFn(delay);
+    const token = await getTokenFn(FABRIC_SCOPE);
+    const res = await fetchFn(opUrl, {
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
+    if (res.status === 429) {
+      const ra = parseInt(res.headers.get("retry-after") ?? "", 10);
+      delay = Number.isFinite(ra) ? Math.max(ra * 1000, 1000) : delay;
+      continue;
+    }
+    if (!res.ok) throw await httpError(res, "GET", opUrl);
     const text = await res.text();
     const state = (text ? JSON.parse(text) : {}) ?? {};
     const status = (state.status ?? "").toLowerCase();
@@ -221,14 +286,13 @@ async function pollLro(opUrl, retryAfterSec) {
     }
     if (status === "succeeded") {
       const resultLoc = res.headers.get("location") ?? `${opUrl}/result`;
-      const rr = await fetch(resultLoc, {
+      const rr = await fetchFn(resultLoc, {
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (rr.ok) {
-        const rt = await rr.text();
-        return rt ? JSON.parse(rt) : {};
-      }
-      return state;
+      if (!rr.ok) throw await httpError(rr, "GET", resultLoc);
+      const rt = await rr.text();
+      return rt ? JSON.parse(rt) : {};
     }
     const ra = parseInt(res.headers.get("retry-after") ?? "", 10);
     if (Number.isFinite(ra)) delay = Math.max(ra * 1000, 1000);
@@ -250,15 +314,26 @@ async function fabricLro(method, path, body) {
 // Polls a Fabric job instance (absolute URL from a jobs/instances 202 Location)
 // until it reaches a terminal status, then returns the final job-instance body.
 const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled", "deduped"]);
-async function pollJobInstance(instanceUrl, retryAfterSec) {
+async function pollJobInstance(
+  instanceUrl,
+  retryAfterSec,
+  { fetchFn = fetch, getTokenFn = getToken, sleepFn = sleep } = {},
+) {
   const started = Date.now();
   let delay = Math.max((retryAfterSec ?? 2) * 1000, 2000);
   while (Date.now() - started < LRO_MAX_WAIT_MS) {
-    await sleep(delay);
-    const token = await getToken(FABRIC_SCOPE);
-    const res = await fetch(instanceUrl, {
+    await sleepFn(delay);
+    const token = await getTokenFn(FABRIC_SCOPE);
+    const res = await fetchFn(instanceUrl, {
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
+    if (res.status === 429) {
+      const ra = parseInt(res.headers.get("retry-after") ?? "", 10);
+      delay = Number.isFinite(ra) ? Math.max(ra * 1000, 2000) : delay;
+      continue;
+    }
+    if (!res.ok) throw await httpError(res, "GET", instanceUrl);
     const text = await res.text();
     const state = (text ? JSON.parse(text) : {}) ?? {};
     if (TERMINAL_JOB_STATUSES.has((state.status ?? "").toLowerCase())) return state;
@@ -484,6 +559,31 @@ function summarizeRun(r) {
     failureReason: r.failureReason ?? null,
     rootActivityId: r.rootActivityId,
   };
+}
+
+function normalizeOneLakeFilePath(path) {
+  const segments = path.replace(/^\/+/, "").split("/");
+  if (!segments.length || segments.some((segment) => !segment)) {
+    throw new Error("path must be a non-empty file path without empty segments.");
+  }
+  for (const segment of segments) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      throw new Error(`path contains an invalid percent-encoded segment: ${segment}`);
+    }
+    if (
+      decoded === "." ||
+      decoded === ".." ||
+      decoded.includes("/") ||
+      decoded.includes("\\") ||
+      decoded.includes("\0")
+    ) {
+      throw new Error("path must not contain traversal or path delimiter segments.");
+    }
+  }
+  return segments.map((segment) => encodeURIComponent(segment)).join("/");
 }
 
 // ─── Write-mode gating ──────────────────────────────────────────────────────
@@ -908,7 +1008,7 @@ server.registerTool(
   "read_onelake_file",
   {
     description:
-      "Read a small file from a Fabric item's OneLake storage (e.g. a notebook output, log, or JSON result under Files/). Returns decoded text, capped in size. Accepts workspace + item by display name or GUID.",
+      "Read a small file from a Fabric item's OneLake storage (e.g. a notebook output, log, or JSON result under Files/). Downloads and returns decoded text capped by bytes. Accepts workspace + item by display name or GUID.",
     inputSchema: {
       workspace: z.string().describe("Workspace display name or GUID"),
       item: z.string().describe("Item display name or GUID"),
@@ -920,22 +1020,26 @@ server.registerTool(
         .positive()
         .max(1_000_000)
         .optional()
-        .describe("Max characters to return (default 100000)"),
+        .describe("Max response bytes to return (default 100000)"),
     },
   },
   safeTool(async ({ workspace, item, type, path, max_bytes }) => {
     const ws = await resolveWorkspace(workspace);
     const it = await resolveItem(ws.id, item, type);
     const cap = max_bytes ?? 100_000;
-    const text = await onelake("GET", `/${ws.id}/${it.id}/${path.replace(/^\/+/, "")}`, { raw: true });
-    const truncated = text.length > cap;
+    const filePath = normalizeOneLakeFilePath(path);
+    const result = await onelake("GET", `/${ws.id}/${it.id}/${filePath}`, {
+      raw: true,
+      maxBytes: cap,
+    });
     return ok({
       workspace: { id: ws.id, displayName: ws.displayName },
       item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
       path,
-      length: text.length,
-      truncated,
-      content: truncated ? text.slice(0, cap) : text,
+      bytesRead: result.bytesRead,
+      totalBytes: result.totalBytes,
+      truncated: result.truncated,
+      content: result.text,
     });
   }),
 );
@@ -1538,6 +1642,11 @@ if (WRITE_ENABLED) {
   );
 }
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error(`[fabric-mcp] v${VERSION} ready (mode=${WRITE_ENABLED ? "write" : "read"})`);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  credential = buildCredential();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error(`[fabric-mcp] v${VERSION} ready (mode=${WRITE_ENABLED ? "write" : "read"})`);
+}
+
+export { normalizeOneLakeFilePath, pollJobInstance, pollLro, readResponseBytes };
