@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { AzurePowerShellCredential } from "@azure/identity";
+import { buildCredential } from "../src/auth/credentials.js";
 import { normalizeOneLakeFilePath } from "../src/fabric/files.js";
 import { readResponseBytes } from "../src/http/client.js";
 import { pollJobInstance, pollLro } from "../src/http/polling.js";
@@ -83,4 +85,15 @@ test("index.js stays import-safe while re-exporting helper modules", async () =>
   assert.equal(typeof module.readResponseBytes, "function");
   assert.equal(typeof module.pollJobInstance, "function");
   assert.equal(typeof module.pollLro, "function");
+});
+
+test("azure-powershell auth mode selects AzurePowerShellCredential", () => {
+  const originalMode = process.env.FABRIC_AUTH_MODE;
+  try {
+    process.env.FABRIC_AUTH_MODE = "azure-powershell";
+    assert.ok(buildCredential() instanceof AzurePowerShellCredential);
+  } finally {
+    if (originalMode === undefined) delete process.env.FABRIC_AUTH_MODE;
+    else process.env.FABRIC_AUTH_MODE = originalMode;
+  }
 });

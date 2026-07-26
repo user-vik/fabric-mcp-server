@@ -74,7 +74,7 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `FABRIC_AUTH_MODE` | no (default `interactive`) | `interactive`, `device-code`, `cli`, `service-principal`, `managed-identity`, or `default`. |
+| `FABRIC_AUTH_MODE` | no (default `interactive`) | `interactive`, `device-code`, `cli`, `azure-powershell`, `service-principal`, `managed-identity`, or `default`. |
 | `AZURE_TENANT_ID` | for interactive / device-code / service-principal | Your Entra tenant ID. |
 | `AZURE_CLIENT_ID` | for service-principal | App registration client ID. |
 | `AZURE_CLIENT_SECRET` | for service-principal | App registration secret. |
@@ -85,6 +85,7 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 - **interactive** — opens a browser; best for desktop/AVD.
 - **device-code** — prints a code + URL to stderr; for SSH / WSL / headless.
 - **cli** — reuses your existing `az login` session.
+- **azure-powershell** — reuses your existing `Connect-AzAccount` session; for hosts with Az PowerShell but no az CLI.
 - **service-principal** — non-interactive with client ID + secret.
 - **managed-identity** — for hosting on Azure.
 - **default** — tries env → managed-identity → CLI → browser in turn.
