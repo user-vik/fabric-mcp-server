@@ -434,6 +434,7 @@ function registerReadTools(server) {
         workspace: { id: ws.id, displayName: ws.displayName },
         item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
         path,
+        length: result.text.length,
         bytesRead: result.bytesRead,
         totalBytes: result.totalBytes,
         truncated: result.truncated,

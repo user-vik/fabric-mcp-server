@@ -36,7 +36,7 @@ test("pollJobInstance retries a throttled request and surfaces the next HTTP fai
           fetchCalls.push({ url, options });
           return responses.shift();
         },
-        getTokenFn: async () => ({ token: "test-token" }),
+        getTokenFn: async () => "test-token",
         sleepFn: async (delay) => sleeps.push(delay),
       }),
     /500: upstream failed/,
@@ -45,6 +45,9 @@ test("pollJobInstance retries a throttled request and surfaces the next HTTP fai
   assert.equal(fetchCalls.length, 2);
   assert.deepEqual(sleeps, [2000, 2000]);
   assert.ok(fetchCalls.every(({ options }) => options.signal instanceof AbortSignal));
+  assert.ok(
+    fetchCalls.every(({ options }) => options.headers.Authorization === "Bearer test-token"),
+  );
 });
 
 test("pollLro surfaces a failed result retrieval after a successful operation", async () => {
@@ -55,15 +58,22 @@ test("pollLro surfaces a failed result retrieval after a successful operation", 
     }),
     new Response("result unavailable", { status: 500 }),
   ];
+  const fetchCalls = [];
 
   await assert.rejects(
     () =>
       pollLro("https://api.fabric.microsoft.com/operation", 0, {
-        fetchFn: async () => responses.shift(),
-        getTokenFn: async () => ({ token: "test-token" }),
+        fetchFn: async (url, options) => {
+          fetchCalls.push({ url, options });
+          return responses.shift();
+        },
+        getTokenFn: async () => "test-token",
         sleepFn: async () => {},
       }),
     /500: result unavailable/,
+  );
+  assert.ok(
+    fetchCalls.every(({ options }) => options.headers.Authorization === "Bearer test-token"),
   );
 });
 
