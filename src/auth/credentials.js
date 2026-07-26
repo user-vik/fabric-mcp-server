@@ -1,5 +1,6 @@
 import {
   AzureCliCredential,
+  AzurePowerShellCredential,
   ClientSecretCredential,
   DefaultAzureCredential,
   DeviceCodeCredential,
@@ -12,6 +13,7 @@ const AUTH_MODES = [
   "interactive",
   "device-code",
   "cli",
+  "azure-powershell",
   "service-principal",
   "managed-identity",
   "default",
@@ -54,6 +56,8 @@ function buildCredential() {
       });
     case "cli":
       return new AzureCliCredential(tenantId ? { tenantId } : undefined);
+    case "azure-powershell":
+      return new AzurePowerShellCredential(tenantId ? { tenantId } : undefined);
     case "service-principal":
       return new ClientSecretCredential(
         requireEnv(tenantId, "AZURE_TENANT_ID", mode),
