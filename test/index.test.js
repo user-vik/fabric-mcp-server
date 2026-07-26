@@ -1,11 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  normalizeOneLakeFilePath,
-  pollJobInstance,
-  pollLro,
-  readResponseBytes,
-} from "../index.js";
+import { normalizeOneLakeFilePath } from "../src/fabric/files.js";
+import { readResponseBytes } from "../src/http/client.js";
+import { pollJobInstance, pollLro } from "../src/http/polling.js";
 
 test("readResponseBytes retains at most the requested bytes and reports truncation", async () => {
   const capped = await readResponseBytes(new Response("abcdefghij"), 5);
@@ -68,4 +65,12 @@ test("pollLro surfaces a failed result retrieval after a successful operation", 
       }),
     /500: result unavailable/,
   );
+});
+
+test("index.js stays import-safe while re-exporting helper modules", async () => {
+  const module = await import("../index.js");
+  assert.equal(module.normalizeOneLakeFilePath("Files/result.json"), "Files/result.json");
+  assert.equal(typeof module.readResponseBytes, "function");
+  assert.equal(typeof module.pollJobInstance, "function");
+  assert.equal(typeof module.pollLro, "function");
 });
