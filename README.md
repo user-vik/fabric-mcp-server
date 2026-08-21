@@ -30,6 +30,7 @@ It talks to the public Fabric REST API (`api.fabric.microsoft.com`) and the Powe
 | `read_onelake_file` | read | Read a small file (log, JSON result) from an item's OneLake storage as decoded text, size-capped. |
 | `list_workspace_roles` | read | Role assignments on a workspace (which principals hold Admin/Member/Contributor/Viewer). |
 | `list_sql_databases` | read | SQL databases in a workspace + connection properties (server FQDN, database name, connection string). |
+| `list_folders` | read | Workspace folders as a flat list with full paths (items reference theirs via `folderId` in `list_items`). |
 | `run_pipeline` | **write** | Trigger an on-demand pipeline run. |
 | `cancel_pipeline_run` | **write** | Cancel an in-progress run. |
 | `refresh_dataset` | **write** | Trigger an on-demand refresh of a semantic model. |
@@ -43,6 +44,9 @@ It talks to the public Fabric REST API (`api.fabric.microsoft.com`) and the Powe
 | `create_item` | **write** | Create an item, optionally from a local definition folder. |
 | `delete_item` | **write** | Delete an item (auto-handles the Gen2 dataflow endpoint quirk); best-effort definition snapshot first. |
 | `add_workspace_role` | **write** | Grant a principal a role (Admin/Member/Contributor/Viewer) on a workspace. |
+| `create_folder` | **write** | Create a workspace folder, optionally under a parent (path, name, or GUID); idempotent if it already exists. |
+| `move_item` | **write** | Move an item into a folder or back to the workspace root — location only, definition untouched. |
+| `delete_folder` | **write** | Delete an empty workspace folder. |
 
 The write tools are only registered when `FABRIC_MCP_MODE=write`.
 

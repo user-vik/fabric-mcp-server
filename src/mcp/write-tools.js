@@ -9,12 +9,13 @@ import {
   resolvePipeline,
   resolveWorkspace,
 } from "../fabric/resolvers.js";
+import { listFolders, resolveFolder } from "../fabric/folders.js";
 import { fabric, fabricListAll, powerbi } from "../http/client.js";
 import { fabricLro, pollJobInstance, summarizeRun } from "../http/polling.js";
 import { ok, safeTool } from "./tool-utils.js";
 
 const WRITE_MODE_MESSAGE =
-  "[fabric-mcp] write mode enabled — run_pipeline, cancel_pipeline_run, refresh_dataset, update_from_git, update_item_definition, create_schedule, update_schedule, delete_schedule, deploy_stage, run_notebook, create_item, delete_item, add_workspace_role exposed";
+  "[fabric-mcp] write mode enabled — run_pipeline, cancel_pipeline_run, refresh_dataset, update_from_git, update_item_definition, create_schedule, update_schedule, delete_schedule, deploy_stage, run_notebook, create_item, delete_item, add_workspace_role, create_folder, move_item, delete_folder exposed";
 
 function registerWriteTools(server) {
   if (!WRITE_ENABLED) return;
@@ -538,6 +539,104 @@ function registerWriteTools(server) {
         principal,
         role,
         result: data,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "create_folder",
+    {
+      description:
+        "Create a folder in a Fabric workspace, optionally under a parent folder. Idempotent: if a folder already exists at that location it is returned instead of erroring. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        display_name: z.string().describe("Name for the new folder (a single segment, not a path)"),
+        parent_folder: z
+          .string()
+          .optional()
+          .describe("Parent folder as a full path (e.g. 'Reports/Sales'), unique name, or GUID. Omit for workspace root."),
+      },
+    },
+    safeTool(async ({ workspace, display_name, parent_folder }) => {
+      const ws = await resolveWorkspace(workspace);
+      const parent = parent_folder ? await resolveFolder(ws.id, parent_folder) : null;
+      const existing = (await listFolders(ws.id)).find(
+        (folder) =>
+          folder.displayName.toLowerCase() === display_name.toLowerCase() &&
+          (folder.parentFolderId ?? null) === (parent?.id ?? null),
+      );
+      if (existing) {
+        return ok({ workspace: { id: ws.id, displayName: ws.displayName }, folder: existing, alreadyExisted: true });
+      }
+      const body = { displayName: display_name, ...(parent ? { parentFolderId: parent.id } : {}) };
+      const data = await fabric("POST", `/workspaces/${ws.id}/folders`, body);
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} create_folder ws=${ws.id} name=${display_name} parent=${parent?.id ?? "root"}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        folder: {
+          id: data.id,
+          displayName: data.displayName,
+          parentFolderId: data.parentFolderId ?? null,
+          path: parent ? `${parent.path ?? parent.id}/${data.displayName}` : data.displayName,
+        },
+        alreadyExisted: false,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "move_item",
+    {
+      description:
+        "Move a Fabric item into a workspace folder (or back to the workspace root). Changes only the item's location — its definition, ID, and schedules are untouched. Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        item: z.string().describe("Item display name or GUID"),
+        type: z.string().optional().describe("Item type to disambiguate the name, e.g. Report, PaginatedReport"),
+        target_folder: z
+          .string()
+          .optional()
+          .describe("Destination folder as a full path (e.g. 'Reports/Sales'), unique name, or GUID. Omit to move to the workspace root."),
+      },
+    },
+    safeTool(async ({ workspace, item, type, target_folder }) => {
+      const ws = await resolveWorkspace(workspace);
+      const it = await resolveItem(ws.id, item, type);
+      const target = target_folder ? await resolveFolder(ws.id, target_folder) : null;
+      const body = target ? { targetFolderId: target.id } : {};
+      await fabric("POST", `/workspaces/${ws.id}/items/${it.id}/move`, body);
+      console.error(
+        `[fabric-mcp][AUDIT] ${new Date().toISOString()} move_item ws=${ws.id} item=${it.id} target=${target?.id ?? "root"}`,
+      );
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        item: { id: it.id, displayName: it.displayName ?? item, type: it.type },
+        movedTo: target ? { id: target.id, path: target.path ?? target.id } : "root",
+      });
+    }),
+  );
+
+  server.registerTool(
+    "delete_folder",
+    {
+      description:
+        "Delete an EMPTY folder from a Fabric workspace (the API rejects folders that still contain items or subfolders — move them out first). Requires FABRIC_MCP_MODE=write.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+        folder: z.string().describe("Folder as a full path (e.g. 'Reports/zz_old_Sales'), unique name, or GUID"),
+      },
+    },
+    safeTool(async ({ workspace, folder }) => {
+      const ws = await resolveWorkspace(workspace);
+      const target = await resolveFolder(ws.id, folder);
+      await fabric("DELETE", `/workspaces/${ws.id}/folders/${target.id}`);
+      console.error(`[fabric-mcp][AUDIT] ${new Date().toISOString()} delete_folder ws=${ws.id} folder=${target.id}`);
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        folder: { id: target.id, path: target.path ?? target.id },
+        deleted: true,
       });
     }),
   );

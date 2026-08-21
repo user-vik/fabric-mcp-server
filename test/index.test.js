@@ -97,3 +97,20 @@ test("azure-powershell auth mode selects AzurePowerShellCredential", () => {
     else process.env.FABRIC_AUTH_MODE = originalMode;
   }
 });
+
+test("buildFolderPaths resolves nested paths and sorts by path", async () => {
+  const { buildFolderPaths } = await import("../src/fabric/folders.js");
+  const folders = buildFolderPaths([
+    { id: "c", displayName: "Sales", parentFolderId: "b" },
+    { id: "a", displayName: "20 Report", parentFolderId: null },
+    { id: "b", displayName: "10 Power BI Reports", parentFolderId: "a" },
+    { id: "d", displayName: "Orphanless" },
+  ]);
+  assert.deepEqual(folders.map((folder) => folder.path), [
+    "20 Report",
+    "20 Report/10 Power BI Reports",
+    "20 Report/10 Power BI Reports/Sales",
+    "Orphanless",
+  ]);
+  assert.equal(folders.find((folder) => folder.id === "c").parentFolderId, "b");
+});

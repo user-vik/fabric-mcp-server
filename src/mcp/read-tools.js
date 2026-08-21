@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { normalizeOneLakeFilePath } from "../fabric/files.js";
+import { listFolders } from "../fabric/folders.js";
 import {
   GUID_RE,
   resolveDataset,
@@ -166,7 +167,28 @@ function registerReadTools(server) {
           type: item.type,
           displayName: item.displayName,
           description: item.description,
+          ...(item.folderId ? { folderId: item.folderId } : {}),
         })),
+      });
+    }),
+  );
+
+  server.registerTool(
+    "list_folders",
+    {
+      description:
+        "List the folders in a Fabric workspace as a flat list with full paths (e.g. 'Reports/Sales'). Use to inspect or verify workspace folder structure — items reference their folder via folderId (see list_items). Accepts workspace by display name or GUID.",
+      inputSchema: {
+        workspace: z.string().describe("Workspace display name or GUID"),
+      },
+    },
+    safeTool(async ({ workspace }) => {
+      const ws = await resolveWorkspace(workspace);
+      const folders = await listFolders(ws.id);
+      return ok({
+        workspace: { id: ws.id, displayName: ws.displayName },
+        count: folders.length,
+        folders,
       });
     }),
   );
