@@ -41,7 +41,9 @@ async function pollLro(
     const retryAfter = parseInt(res.headers.get("retry-after") ?? "", 10);
     if (Number.isFinite(retryAfter)) delay = Math.max(retryAfter * 1000, 1000);
   }
-  throw new Error(`Fabric operation timed out after ${LRO_MAX_WAIT_MS}ms: ${opUrl}`);
+  throw new Error(
+    `Poll timed out after ${LRO_MAX_WAIT_MS}ms waiting for the Fabric operation to finish. This is a POLL timeout, not an operation failure — the operation may still be running: ${opUrl}`,
+  );
 }
 
 async function fabricLro(method, path, body) {
@@ -81,9 +83,17 @@ async function pollJobInstance(
     const retryAfter = parseInt(res.headers.get("retry-after") ?? "", 10);
     if (Number.isFinite(retryAfter)) delay = Math.max(retryAfter * 1000, 2000);
   }
+  const jobInstanceId = jobInstanceIdFrom(instanceUrl);
   throw new Error(
-    `Job instance did not reach a terminal status within ${LRO_MAX_WAIT_MS}ms: ${instanceUrl}`,
+    `Poll timed out after ${LRO_MAX_WAIT_MS}ms waiting for job instance ${jobInstanceId ?? "?"} to reach a terminal status. This is a POLL timeout, not a job failure — the job is still running. Check it with get_item_run / list_item_runs (job_instance_id=${jobInstanceId ?? "?"}): ${instanceUrl}`,
   );
+}
+
+/** Extract the job instance GUID from a jobs/instances/{id} Location URL. */
+function jobInstanceIdFrom(location) {
+  if (!location) return null;
+  const match = String(location).match(/\/jobs\/instances\/([0-9a-f-]{36})/i);
+  return match ? match[1] : null;
 }
 
 function summarizeRun(run) {
@@ -103,4 +113,4 @@ function summarizeRun(run) {
   };
 }
 
-export { fabricLro, pollJobInstance, pollLro, summarizeRun };
+export { TERMINAL_JOB_STATUSES, fabricLro, jobInstanceIdFrom, pollJobInstance, pollLro, summarizeRun };
