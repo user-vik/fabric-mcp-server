@@ -73,7 +73,7 @@ const getPipelineRun = defineTool({
 const listItemRuns = defineTool({
   name: "list_item_runs",
   description:
-    "List job instances (runs) for ANY Fabric item — notebooks, Spark job definitions, dataflows, pipelines — most-recent first, with status, duration and failureReason. Use after a detached run_notebook to answer 'how did that run go'. Accepts workspace + item by display name or GUID.",
+    "List job instances (runs) for any Fabric item that runs as a job — notebooks, Spark job definitions, dataflows, pipelines — most-recent first, with status, duration and failureReason. Use after a detached run_notebook to answer 'how did that run go'. Items without jobs (semantic models, reports) return ItemNotFound from the API; use get_refresh_history for model refreshes. Accepts workspace + item by display name or GUID.",
   schema: {
     workspace: workspaceField,
     item: z.string().describe("Item display name or GUID"),
