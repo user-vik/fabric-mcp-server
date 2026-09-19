@@ -29,12 +29,22 @@ async function pollLro(
       throw new Error(`Fabric operation failed: ${JSON.stringify(state.error ?? state)}`);
     }
     if (status === "succeeded") {
+      // Some operations (getDefinition, deploy, create) publish a result at the
+      // Location header or at {op}/result. Others (commitToGit, updateFromGit)
+      // have no result: the /result probe answers 400 OperationHasNoResult, and
+      // the operation state itself is the outcome.
       const resultLoc = res.headers.get("location") ?? `${opUrl}/result`;
       const rr = await fetchFn(resultLoc, {
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (!rr.ok) throw await httpError(rr, "GET", resultLoc);
+      if (!rr.ok) {
+        const body = await rr.text();
+        if (rr.status === 400 && /OperationHasNoResult/i.test(body)) return { ...state, _noResult: true };
+        const err = new Error(`GET ${resultLoc} -> ${rr.status}: ${body}`);
+        err.status = rr.status;
+        throw err;
+      }
       const rt = await rr.text();
       return rt ? JSON.parse(rt) : {};
     }
