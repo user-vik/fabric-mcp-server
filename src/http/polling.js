@@ -40,7 +40,7 @@ async function pollLro(
       });
       if (!rr.ok) {
         const body = await rr.text();
-        if (rr.status === 400 && /OperationHasNoResult/i.test(body)) return { ...state, _noResult: true };
+        if (rr.status === 400 && errorCodeOf(body) === "OperationHasNoResult") return { ...state, _noResult: true };
         const err = new Error(`GET ${resultLoc} -> ${rr.status}: ${body}`);
         err.status = rr.status;
         throw err;
@@ -54,6 +54,16 @@ async function pollLro(
   throw new Error(
     `Poll timed out after ${LRO_MAX_WAIT_MS}ms waiting for the Fabric operation to finish. This is a POLL timeout, not an operation failure — the operation may still be running: ${opUrl}`,
   );
+}
+
+/** The structured errorCode from a Fabric ErrorResponse body, or null when the body is not one. */
+function errorCodeOf(body) {
+  try {
+    const parsed = JSON.parse(body);
+    return typeof parsed?.errorCode === "string" ? parsed.errorCode : null;
+  } catch {
+    return null;
+  }
 }
 
 async function fabricLro(method, path, body) {

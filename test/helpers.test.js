@@ -111,6 +111,19 @@ test("pollLro treats OperationHasNoResult as success and returns the operation s
     () => pollLro("https://api.fabric.microsoft.com/v1/operations/op-2", 0, { fetchFn: async () => failing.shift(), getTokenFn: async () => "t", sleepFn: async () => {} }),
     /403: nope/,
   );
+
+  // Only the structured errorCode counts: a 400 that merely mentions the string
+  // in its message, or a non-JSON body, is still a failure.
+  for (const body of [
+    JSON.stringify({ errorCode: "InvalidRequest", message: "see OperationHasNoResult docs" }),
+    "OperationHasNoResult",
+  ]) {
+    const lookalike = [new Response(JSON.stringify(state), { status: 200 }), new Response(body, { status: 400 })];
+    await assert.rejects(
+      () => pollLro("https://api.fabric.microsoft.com/v1/operations/op-3", 0, { fetchFn: async () => lookalike.shift(), getTokenFn: async () => "t", sleepFn: async () => {} }),
+      /400/,
+    );
+  }
 });
 
 test("initializeCredential is memoised so concurrent first callers share one sign-in", async () => {
