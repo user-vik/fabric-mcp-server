@@ -15,6 +15,12 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const LRO_MAX_WAIT_MS = 300_000;
 const WRITE_ENABLED = (process.env.FABRIC_MCP_MODE ?? "read").toLowerCase() === "write";
 
+// Token cache: "memory" (default for the MCP server, which lives for the whole
+// session) or "persistent" (default for the CLI, where each command is a fresh
+// process and would otherwise re-prompt for sign-in).
+const TOKEN_CACHE_PERSISTENT = ["persistent", "true", "1"].includes((process.env.FABRIC_TOKEN_CACHE ?? "memory").toLowerCase());
+const TOKEN_CACHE_NAME = process.env.FABRIC_TOKEN_CACHE_NAME || "fabric-mcp-server";
+
 export {
   FABRIC_BASE,
   FABRIC_SCOPE,
@@ -26,6 +32,8 @@ export {
   REQUEST_TIMEOUT_MS,
   RETRY_MAX_DELAY_MS,
   STORAGE_SCOPE,
+  TOKEN_CACHE_NAME,
+  TOKEN_CACHE_PERSISTENT,
   VERSION,
   WRITE_ENABLED,
 };
