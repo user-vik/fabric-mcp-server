@@ -87,6 +87,45 @@ test("jobInstanceIdFrom extracts the GUID from a jobs/instances Location and pol
   }
 });
 
+test("pollLro treats OperationHasNoResult as success and returns the operation state", async () => {
+  const { pollLro } = await import("../src/http/polling.js");
+  const state = { status: "Succeeded", createdTimeUtc: "2026-09-19T01:32:00Z", percentComplete: 100 };
+  const responses = [
+    new Response(JSON.stringify(state), { status: 200 }),
+    new Response(JSON.stringify({ errorCode: "OperationHasNoResult", message: "The operation has no result" }), { status: 400 }),
+  ];
+  const result = await pollLro("https://api.fabric.microsoft.com/v1/operations/op-1", 0, {
+    fetchFn: async () => responses.shift(),
+    getTokenFn: async () => "t",
+    sleepFn: async () => {},
+  });
+  assert.equal(result.status, "Succeeded");
+  assert.equal(result._noResult, true);
+
+  // Any other failure on the result fetch still surfaces (existing contract).
+  const failing = [
+    new Response(JSON.stringify(state), { status: 200 }),
+    new Response("nope", { status: 403 }),
+  ];
+  await assert.rejects(
+    () => pollLro("https://api.fabric.microsoft.com/v1/operations/op-2", 0, { fetchFn: async () => failing.shift(), getTokenFn: async () => "t", sleepFn: async () => {} }),
+    /403: nope/,
+  );
+
+  // Only the structured errorCode counts: a 400 that merely mentions the string
+  // in its message, or a non-JSON body, is still a failure.
+  for (const body of [
+    JSON.stringify({ errorCode: "InvalidRequest", message: "see OperationHasNoResult docs" }),
+    "OperationHasNoResult",
+  ]) {
+    const lookalike = [new Response(JSON.stringify(state), { status: 200 }), new Response(body, { status: 400 })];
+    await assert.rejects(
+      () => pollLro("https://api.fabric.microsoft.com/v1/operations/op-3", 0, { fetchFn: async () => lookalike.shift(), getTokenFn: async () => "t", sleepFn: async () => {} }),
+      /400/,
+    );
+  }
+});
+
 test("initializeCredential is memoised so concurrent first callers share one sign-in", async () => {
   const { initializeCredential } = await import("../src/auth/credentials.js");
   const originalMode = process.env.FABRIC_AUTH_MODE;

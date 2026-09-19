@@ -29,12 +29,22 @@ async function pollLro(
       throw new Error(`Fabric operation failed: ${JSON.stringify(state.error ?? state)}`);
     }
     if (status === "succeeded") {
+      // Some operations (getDefinition, deploy, create) publish a result at the
+      // Location header or at {op}/result. Others (commitToGit, updateFromGit)
+      // have no result: the /result probe answers 400 OperationHasNoResult, and
+      // the operation state itself is the outcome.
       const resultLoc = res.headers.get("location") ?? `${opUrl}/result`;
       const rr = await fetchFn(resultLoc, {
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (!rr.ok) throw await httpError(rr, "GET", resultLoc);
+      if (!rr.ok) {
+        const body = await rr.text();
+        if (rr.status === 400 && errorCodeOf(body) === "OperationHasNoResult") return { ...state, _noResult: true };
+        const err = new Error(`GET ${resultLoc} -> ${rr.status}: ${body}`);
+        err.status = rr.status;
+        throw err;
+      }
       const rt = await rr.text();
       return rt ? JSON.parse(rt) : {};
     }
@@ -44,6 +54,16 @@ async function pollLro(
   throw new Error(
     `Poll timed out after ${LRO_MAX_WAIT_MS}ms waiting for the Fabric operation to finish. This is a POLL timeout, not an operation failure — the operation may still be running: ${opUrl}`,
   );
+}
+
+/** The structured errorCode from a Fabric ErrorResponse body, or null when the body is not one. */
+function errorCodeOf(body) {
+  try {
+    const parsed = JSON.parse(body);
+    return typeof parsed?.errorCode === "string" ? parsed.errorCode : null;
+  } catch {
+    return null;
+  }
 }
 
 async function fabricLro(method, path, body) {
