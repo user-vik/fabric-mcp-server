@@ -154,25 +154,45 @@ function buildCredential({ authenticationRecord } = {}) {
 }
 
 async function getToken(scope = FABRIC_SCOPE) {
-  if (!credential) await initializeCredential();
-  const token = await credential.getToken(scope);
+  const cred = credential ?? (await initializeCredential());
+  const token = await cred.getToken(scope);
   return token.token;
 }
 
-async function initializeCredential() {
+let initPromise;
+
+/**
+ * Build the credential exactly once per process. Concurrent first callers
+ * (e.g. two API requests fired with Promise.all before any token exists) share
+ * the same in-flight initialization, so an interactive sign-in can never be
+ * prompted twice. A failed initialization is not cached, so the next call
+ * retries.
+ */
+function initializeCredential() {
+  if (!initPromise) {
+    initPromise = doInitialize().catch((error) => {
+      initPromise = undefined;
+      throw error;
+    });
+  }
+  return initPromise;
+}
+
+async function doInitialize() {
   const persistent = TOKEN_CACHE_PERSISTENT && (await enableTokenCachePersistence());
   const useRecord = persistent && RECORD_MODES.has(authMode());
   const recordPath = useRecord ? authRecordPath() : null;
-  credential = buildCredential({ authenticationRecord: useRecord ? readAuthRecord(recordPath) : undefined });
-  if (useRecord && typeof credential.authenticate === "function") {
+  const built = buildCredential({ authenticationRecord: useRecord ? readAuthRecord(recordPath) : undefined });
+  if (useRecord && typeof built.authenticate === "function") {
     // Silent when the record + cached refresh token are valid; interactive only
     // on first use or after the cached account went stale. Either way the
     // returned record is the current one, so persist it for the next process.
-    const record = await credential.authenticate(FABRIC_SCOPE);
+    const record = await built.authenticate(FABRIC_SCOPE);
     if (record && writeAuthRecord(recordPath, record)) {
       console.error(`[fabric-mcp] signed in as ${record.username}; auth record saved to ${recordPath}`);
     }
   }
+  credential = built;
   return credential;
 }
 

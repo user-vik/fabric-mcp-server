@@ -87,6 +87,22 @@ test("jobInstanceIdFrom extracts the GUID from a jobs/instances Location and pol
   }
 });
 
+test("initializeCredential is memoised so concurrent first callers share one sign-in", async () => {
+  const { initializeCredential } = await import("../src/auth/credentials.js");
+  const originalMode = process.env.FABRIC_AUTH_MODE;
+  try {
+    // cli mode builds a credential without any network or browser interaction.
+    process.env.FABRIC_AUTH_MODE = "cli";
+    const [a, b, c] = await Promise.all([initializeCredential(), initializeCredential(), initializeCredential()]);
+    assert.equal(a, b);
+    assert.equal(b, c);
+    assert.equal(await initializeCredential(), a, "later calls reuse the same credential");
+  } finally {
+    if (originalMode === undefined) delete process.env.FABRIC_AUTH_MODE;
+    else process.env.FABRIC_AUTH_MODE = originalMode;
+  }
+});
+
 test("authRecordPath is keyed by cache name, mode, tenant and client under the user profile", async () => {
   const { authRecordPath } = await import("../src/auth/credentials.js");
   const path = authRecordPath({ mode: "interactive", tenantId: "924c0f91-0000-0000-0000-000000000000", clientId: undefined });

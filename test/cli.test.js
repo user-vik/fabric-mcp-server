@@ -85,6 +85,30 @@ test("parseToolArgs reads @file for JSON values and rejects unknown or invalid f
   assert.deepEqual(parseToolArgs(getTool("list_workspaces").schema, new Map([["out", "x.json"], ["compact", true]])), {});
 });
 
+test("parseToolArgs turns unreadable @files and malformed arrays into UsageErrors, not stack traces", () => {
+  const pipeline = getTool("run_pipeline").schema;
+  assert.throws(
+    () => parseToolArgs(pipeline, new Map([["workspace", "w"], ["pipeline", "p"], ["parameters", "@Z:/definitely/missing.json"]])),
+    (error) => error instanceof UsageError && /cannot read/.test(error.message),
+  );
+  const commit = getTool("commit_to_git").schema;
+  assert.throws(
+    () => parseToolArgs(commit, new Map([["workspace", "w"], ["items", "[not json"]])),
+    (error) => error instanceof UsageError && /JSON array/.test(error.message),
+  );
+  const refresh = getTool("refresh_sql_endpoint_metadata").schema;
+  const tooMany = Array.from({ length: 26 }, (_, index) => `t${index}`).join(",");
+  assert.throws(() => parseToolArgs(refresh, new Map([["workspace", "w"], ["item", "lh"], ["tables", tooMany]])), UsageError);
+  assert.equal(parseToolArgs(refresh, new Map([["workspace", "w"], ["item", "lh"], ["tables", "a,b"]])).tables.length, 2);
+});
+
+test("runCli rejects --out without a path as a usage error", async () => {
+  const errors = [];
+  const result = await captureStdout(() => runCli(["list-workspaces", "--out"], { stderr: (msg) => errors.push(msg) }));
+  assert.equal(result.result, EXIT_USAGE);
+  assert.match(errors.at(-1), /--out needs a file path/);
+});
+
 test("describeSchema and toolHelp expose kebab-case flags with required markers", () => {
   const fields = describeSchema(getTool("get_item_run").schema);
   const byFlag = Object.fromEntries(fields.map((field) => [field.flag, field]));

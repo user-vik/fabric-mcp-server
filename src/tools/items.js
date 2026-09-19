@@ -183,9 +183,10 @@ const refreshSqlEndpointMetadata = defineTool({
     item: z.string().describe("Lakehouse, MirroredDatabase, or SQLEndpoint display name or GUID"),
     type: z.string().optional().describe("Item type to disambiguate the name (Lakehouse, MirroredDatabase, SQLEndpoint)"),
     tables: z
-      .array(z.string())
+      .array(z.string().min(1))
+      .max(25)
       .optional()
-      .describe("Only refresh these tables, as 'schema.table' or 'table' (default schema dbo). Omit for all tables."),
+      .describe("Only refresh these tables, as 'schema.table' or 'table' (default schema dbo); the API accepts at most 25 per request. Omit for all tables."),
     recreate_tables: z.boolean().optional().describe("Drop and recreate the (scoped) tables on the endpoint (default false)"),
   },
   handler: async ({ workspace, item, type, tables, recreate_tables }) => {

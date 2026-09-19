@@ -116,6 +116,12 @@ async function runCli(argv, { stderr = console.error } = {}) {
     return EXIT_USAGE;
   }
 
+  const out = flags.get("out");
+  if (out !== undefined && (typeof out !== "string" || !out.trim())) {
+    stderr("--out needs a file path, e.g. --out result.json");
+    return EXIT_USAGE;
+  }
+
   let args;
   try {
     args = parseToolArgs(tool.schema, flags);
@@ -127,14 +133,20 @@ async function runCli(argv, { stderr = console.error } = {}) {
     throw error;
   }
 
+  let result;
   try {
-    const result = await tool.handler(args);
-    emit(result ?? {}, { out: flags.get("out"), compact: flags.has("compact") && flags.get("compact") !== false });
-    return EXIT_OK;
+    result = await tool.handler(args);
   } catch (error) {
     stderr(error?.message ?? String(error));
     return EXIT_TOOL_ERROR;
   }
+  try {
+    emit(result ?? {}, { out, compact: flags.has("compact") && flags.get("compact") !== false });
+  } catch (error) {
+    stderr(`Tool succeeded but writing output failed: ${error?.message ?? String(error)}`);
+    return EXIT_TOOL_ERROR;
+  }
+  return EXIT_OK;
 }
 
 export { EXIT_OK, EXIT_TOOL_ERROR, EXIT_USAGE, TOOLS, emit, firstSentence, runCli, toolHelp, toolsListing, usage };

@@ -50,15 +50,19 @@ function normalizeKey(flag) {
   return flag.replace(/^--/, "").replace(/-/g, "_");
 }
 
-function readValueSource(value) {
+function readValueSource(value, key) {
   if (typeof value === "string" && value.startsWith("@") && value.length > 1) {
-    return readFileSync(value.slice(1), "utf8");
+    try {
+      return readFileSync(value.slice(1), "utf8");
+    } catch (error) {
+      throw new UsageError(`--${key}: cannot read ${value.slice(1)} (${error.code ?? error.message})`);
+    }
   }
   return value;
 }
 
 function coerce(kind, raw, key) {
-  const value = readValueSource(raw);
+  const value = readValueSource(raw, key);
   switch (kind) {
     case "string":
       return String(value);
@@ -73,7 +77,13 @@ function coerce(kind, raw, key) {
       throw new UsageError(`--${key} expects true/false, got "${value}"`);
     case "string[]": {
       const trimmed = String(value).trim();
-      if (trimmed.startsWith("[")) return JSON.parse(trimmed);
+      if (trimmed.startsWith("[")) {
+        try {
+          return JSON.parse(trimmed);
+        } catch (error) {
+          throw new UsageError(`--${key} expects a JSON array or comma-separated values: ${error.message}`);
+        }
+      }
       return trimmed
         .split(",")
         .map((entry) => entry.trim())
